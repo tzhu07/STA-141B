@@ -1,0 +1,458 @@
+---
+title: "Final presentation - Group 15"
+author: "Tracy Zhu, Lynn Waiyan Kyaw, Yucheng Zhao"
+date: '2023-06-09'
+output: html_document
+---
+
+
+# Data cleaning
+## Required packages
+```{r}
+library(tidyverse)
+library(readr)
+library(Metrics)
+library(Matrix)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+library(MASS)
+library(caret)
+library(randomForest)
+library(e1071)
+library(glmnet)
+```
+
+## Check the data
+```{r}
+
+train <- read.csv("C:\\Users\\Lynn's GF65 Laptop\\Documents\\UC Davis Course work\\STA 141C\\Final Project\\house-prices-advanced-regression-techniques\\train.csv", header=TRUE)
+
+test <- read.csv("C:\\Users\\Lynn's GF65 Laptop\\Documents\\UC Davis Course work\\STA 141C\\Final Project\\house-prices-advanced-regression-techniques\\test.csv", header = TRUE)
+
+cat('Dimension of train dataset:', dim(train), '\n')
+cat('Column names of train dataset:', '\n')
+colnames(train)
+```
+
+## Set SalePrice as the response variable and combine dataset
+```{r}
+# Take out test ID
+test_Id <- test$Id
+test$Id <- NULL
+train$Id <- NULL
+test$SalePrice <- NA
+
+# Combine test and train dataset
+dat1 <- rbind(train, test)
+dim(dat1)
+dat1 <- dat1 %>%
+  mutate(across(where(is.integer), as.numeric))
+
+# Check the combined dataset
+num_var <- which(sapply(dat1, is.numeric))
+cat('There are',length(num_var), 'numeric variables.','\n')
+non_num_var <- which(!sapply(dat1, is.numeric))
+cat('There are',length(non_num_var), 'non-numeric variables.','\n')
+```
+
+## Adjust the variables
+### Find correlations with SalePrice and multicollinearity betweeen the predict variables
+```{r}
+# Correlation
+num_var <- which(sapply(dat1, is.numeric))
+dat1_num_var <- dat1[, num_var]
+
+# Use only the pairwise complete observations, ignor missing values
+cor <- cor(dat1_num_var, use="pairwise.complete.obs") 
+sort_cor <- as.matrix(sort(cor[,'SalePrice'], decreasing = TRUE))
+
+# Only keep high correlations (coefficient value > 0.5)
+high_cor <- names(which(apply(sort_cor, 1, function(x) abs(x)>0.5)))
+cor <- cor[high_cor, high_cor]
+corrplot.mixed(cor, tl.col="black", tl.pos = "lt")
+```
+
+### Remove multicollinearity and see correlations again
+```{r}
+# Remove multidisciplinary and duplicated variables
+rem <- c( 'GarageYrBlt', 'GarageArea', 'GarageCond', 'TotalBsmtSF', 'TotRmsAbvGrd')
+dat1 <- dat1[,!(names(dat1) %in% rem)]
+
+# Check again
+num_var <- which(sapply(dat1, is.numeric))
+cat('There are',length(num_var), 'numeric variables.','\n')
+non_num_var <- which(!sapply(dat1, is.numeric))
+cat('There are',length(non_num_var), 'non-numeric variables.','\n')
+
+# See new correlations
+dat1_num_var <- dat1[, num_var]
+cor <- cor(dat1_num_var, use="pairwise.complete.obs") 
+sort_cor <- as.matrix(sort(cor[,'SalePrice'], decreasing = TRUE))
+
+# Only keep high correlations (>0.5)
+high_cor <- names(which(apply(sort_cor, 1, function(x) abs(x)>0.5)))
+cor <- cor[high_cor, high_cor]
+corrplot.mixed(cor, tl.col="black", tl.pos = "lt")
+```
+
+## Create a new dataset with 7 high-correlated predict variables
+```{r}
+pred <- c( 'SalePrice', 'OverallQual', 'GrLivArea', 'GarageCars', 'X1stFlrSF', 'FullBath', 'YearBuilt', 'YearRemodAdd')
+dat1 <- dat1[, (names(dat1) %in% pred)]
+dat <- dat1[, match(pred, names(dat1))]
+dat <- as.data.frame(lapply(dat, as.numeric))
+```
+
+## Check two most related predict variables (>0.7)
+### Overall Quality
+```{r}
+ggplot(data=dat[!is.na(dat$SalePrice),], aes(x=factor(OverallQual), y=SalePrice))+
+        geom_boxplot(col='black') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 1000000, by=100000))
+```
+
+### Above Grade Living Area
+```{r}
+ggplot(data = dat[!is.na(dat$SalePrice),], aes(x = GrLivArea, y = SalePrice)) +
+  geom_point(col = 'red') +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  scale_y_continuous(breaks = seq(0, 800000, by = 100000)) +
+  geom_text(data = subset(dat, GrLivArea > 4500 & !is.na(SalePrice)), 
+            aes(x = GrLivArea, y = SalePrice, label = rownames(subset(dat, GrLivArea > 4500 & !is.na(SalePrice)))),
+            hjust = 0, vjust = 2, size = 4)
+```
+
+## Check completeness
+```{r}
+# See if we need to remove two outliers?
+dat[c(524, 1299), c('SalePrice', 'OverallQual')]
+ncol(dat)
+dat <- dat[-c(524, 1299),]
+```
+These two houses have the highest score on Overall Quality, which is deviant. So we should remove these two outliers.
+
+## Process missing values
+```{r}
+NAcol <- which(colSums(is.na(dat)) > 0)
+sort(colSums(sapply(dat[NAcol], is.na)), decreasing = TRUE)
+cat('There are', length(NAcol), 'columns with missing values', '\n')
+names(sort(colSums(sapply(dat[NAcol], is.na)), decreasing = TRUE))
+```
+
+### Replace missing values with interpolated values
+```{r}
+library(zoo)
+dat$GarageCars <- na.approx(dat$GarageCars, na.rm = FALSE)
+
+# Check it again
+NAcol <- which(colSums(is.na(dat)) > 0)
+sort(colSums(sapply(dat[NAcol], is.na)), decreasing = TRUE)
+cat('There are', length(NAcol), 'columns with missing values', '\n')
+names(sort(colSums(sapply(dat[NAcol], is.na)), decreasing = TRUE))
+
+# Heatmap
+cor_matrix <- cor(dat, use = "pairwise.complete.obs")
+corrplot(cor_matrix, method = "color", tl.col = "black")
+```
+
+## Normalize the right skewed distribution
+```{r}
+# Normalize the right-skewed distribution
+ggplot(data = dat[!is.na(dat$SalePrice),], aes(x = SalePrice)) +
+  geom_histogram(binwidth = 10000, color = "black", fill = "lightblue") +
+  scale_x_continuous(breaks = seq(0, 1000000, by = 100000)) +
+  geom_vline(aes(xintercept = mean(SalePrice)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = median(SalePrice)), color = "darkblue", linetype = "dashed", size = 1)
+
+dat$log_SalePrice <- log(dat$SalePrice)
+
+ggplot(data = dat[!is.na(dat$SalePrice),], aes(x = log_SalePrice)) +
+  geom_histogram(binwidth = 0.1, color = "black", fill = "lightblue") +
+  scale_x_continuous(breaks = seq(0, 1000000, by = 100000)) +
+  geom_vline(aes(xintercept = mean(log_SalePrice)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = median(log_SalePrice)), color = "darkblue", linetype = "dashed", size = 1) 
+
+# Back-transformation of log_SalePrice to SalePrice
+dat$SalePrice <- exp(dat$log_SalePrice)
+
+# Check the distribution of back-transformed SalePrice
+ggplot(data = dat[!is.na(dat$SalePrice),], aes(x = SalePrice)) +
+  geom_histogram(binwidth = 10000, color = "black", fill = "lightblue") +
+  scale_x_continuous(breaks = seq(0, 1000000, by = 100000)) +
+  geom_vline(aes(xintercept = mean(SalePrice)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = median(SalePrice)), color = "darkblue", linetype = "dashed", size = 1)
+```
+Test dataset does not have SalePrice, so we do not need to fill up these missing values. Instead, we can separate test and train data according to SalePrice.
+
+## Separate train and test dataset
+```{r}
+train <- dat[!is.na(dat$SalePrice) | !is.na(dat$log_SalePrice), c(-which(names(dat) == "log_SalePrice"))]
+test <- dat[is.na(dat$SalePrice) | is.na(dat$SalePrice), c(-which(names(dat) == "log_SalePrice"))]
+
+cat('Dimension of train dataset:', dim(train), '\n')
+cat('Dimension of train dataset:', dim(test), '\n')
+
+test <- as.data.frame(lapply(test, as.numeric))
+
+str(train)
+str(test)
+
+# Check for NAs
+cat(length(which(colSums(is.na(train)) > 0)), 'columns in train dataset have missing values. ', '\n')
+cat(length(which(colSums(is.na(test)) > 0)), 'columns in test dataset have missing values:', '\n')
+sort(colSums(sapply(test[NAcol], is.na)), decreasing = TRUE)
+```
+
+# Prepare the models
+## Create dummy test dataset
+```{r}
+dummy_test <- train[, !(names(train) %in% "SalePrice")]
+```
+
+# Models
+## lm
+```{r}
+lm_model <- lm(SalePrice ~ OverallQual + GrLivArea + GarageCars + X1stFlrSF + FullBath + YearBuilt + YearRemodAdd, data = train)
+summary(lm_model)
+
+# Visualized predicted and observed values for LM model
+lm_predicted <- predict(lm_model, newdata = dummy_test)
+lm_comparison <- data.frame(Observed = train$SalePrice, Predicted = lm_predicted)
+ggplot(lm_comparison, aes(x = Observed, y = Predicted)) +
+  geom_point(color = "blue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(x = "Observed SalePrice", y = "Predicted SalePrice") +
+  ggtitle("LM: Predicted vs. Observed SalePrice") +
+  theme_minimal()
+
+# Residual plot for LM model
+residuals_lm <- train$SalePrice - lm_predicted
+ggplot() +
+  geom_histogram(aes(x = residuals_lm, y = ..density..), color = "black", fill = "lightblue") +
+  geom_density(aes(x = residuals_lm), color = "red") +
+  labs(x = "Residuals", y = "Density") +
+  ggtitle("Residuals Distribution - LM Model")
+```
+
+## GLM
+```{r}
+glm_model <- glm(SalePrice ~ OverallQual + GrLivArea + GarageCars + X1stFlrSF + FullBath + YearBuilt + YearRemodAdd, data = train)
+summary(glm_model)
+glm_predicted <- predict(glm_model, newdata = dummy_test, type = "response")
+
+# Visualized predicted and observed values for GLM model
+glm_comparison <- data.frame(Observed = train$SalePrice, Predicted = glm_predicted)
+ggplot(glm_comparison, aes(x = Observed, y = Predicted)) +
+  geom_point(color = "blue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(x = "Observed SalePrice", y = "Predicted SalePrice") +
+  ggtitle("GLM: Predicted vs. Observed SalePrice") +
+  theme_minimal()
+
+# Residual plot for GLM model
+residuals_glm <- train$SalePrice - glm_predicted
+ggplot() +
+  geom_histogram(aes(x = residuals_glm, y = ..density..), color = "black", fill = "lightblue") +
+  geom_density(aes(x = residuals_glm), color = "red") +
+  labs(x = "Residuals", y = "Density") +
+  ggtitle("Residuals Distribution - GLM Model")
+
+```
+
+## ANOVA
+```{r}
+anova_model <- aov(SalePrice ~ OverallQual + GrLivArea + GarageCars + X1stFlrSF + FullBath + YearBuilt + YearRemodAdd, data = train)
+summary(anova_model)
+anova_predicted <- predict(anova_model, newdata = dummy_test)
+
+# Visualized predicted and observed values for ANOVA model
+anova_comparison <- data.frame(Observed = train$SalePrice, Predicted = anova_predicted)
+ggplot(anova_comparison, aes(x = Observed, y = Predicted)) +
+  geom_point(color = "blue") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(x = "Observed SalePrice", y = "Predicted SalePrice") +
+  ggtitle("ANOVA: Predicted vs. Observed SalePrice") +
+  theme_minimal()
+
+# Residual plot for ANOVA model
+residuals_anova <- train$SalePrice - anova_predicted
+ggplot() +
+  geom_histogram(aes(x = residuals_anova, y = ..density..), color = "black", fill = "lightblue") +
+  geom_density(aes(x = residuals_anova), color = "red") +
+  labs(x = "Residuals", y = "Density") +
+  ggtitle("Residuals Distribution - ANOVA Model")
+
+```
+
+
+## Accuracy
+```{r}
+# Calculate accuracy metrics for LM model
+lm_rmse <- sqrt(mean((train$SalePrice - lm_predicted)^2))
+lm_mae <- mean(abs(train$SalePrice - lm_predicted))
+
+# Calculate accuracy metrics for ANOVA model
+anova_rmse <- sqrt(mean((train$SalePrice - anova_predicted)^2))
+anova_mae <- mean(abs(train$SalePrice - anova_predicted))
+
+# Calculate accuracy metrics for GLM model
+glm_rmse <- sqrt(mean((train$SalePrice - glm_predicted)^2))
+glm_mae <- mean(abs(train$SalePrice - glm_predicted))
+
+# Output results for accuracy metrics
+cat("Accuracy metrics for LM model:\n")
+cat("RMSE:", lm_rmse, "\n")
+cat("MAE:", lm_mae, "\n\n")
+
+cat("Accuracy metrics for ANOVA model:\n")
+cat("RMSE:", anova_rmse, "\n")
+cat("MAE:", anova_mae, "\n\n")
+
+cat("Accuracy metrics for GLM model:\n")
+cat("RMSE:", glm_rmse, "\n")
+cat("MAE:", glm_mae, "\n")
+```
+
+
+# Decomposition
+```{r}
+train <- train %>% mutate_if(is.integer, as.numeric)
+X <- train[, sapply(train, is.numeric)]
+X <- train[, -which(names(train) == "SalePrice")]
+X <- as.matrix(X)
+X <- cbind(1, X)
+Y <- train$SalePrice
+Y <- as.matrix(Y)
+```
+
+## LU decomposition
+```{r}
+start.time_lu = Sys.time()
+XtX <- t(X)%*%X
+XtY <- t(X)%*%Y
+start.time <- Sys.time()
+lu <- expand(lu(XtX))
+L <- lu$L
+U <- lu$U
+P <- lu$P
+reg_coef_lu <- solve(P%*%L%*%U, XtY)
+end.time_lu = Sys.time()
+cat("Computation time of LU:\n")
+end.time_lu - start.time_lu
+```
+
+## QR decomposition
+```{r}
+start.time_qr = Sys.time()
+qr <- qr(X)
+Q <- qr.Q(qr)
+R <- qr.R(qr)
+reg_coef_qr <- qr.solve(R, t(Q) %*% Y)
+end.time_qr = Sys.time()
+cat("\nComputation time of QR:\n")
+end.time_qr - start.time_qr
+```
+
+## SVD
+```{r}
+start.time_svd = Sys.time()
+svd <- svd(XtX)
+S_inv <- diag(1/(svd$d))
+V <- svd$v
+U <- svd$u
+#reg_coef_svd <- solve(U%*%S%*%t(V), t(X)%*%Y)
+#reg_coef_svd
+reg_coef_svd <- V %*% S_inv %*% t(U) %*% t(X) %*% Y
+end.time_svd = Sys.time()
+cat("\nComputation time of SVD:\n")
+end.time_svd - start.time_svd
+```
+
+## time summary
+```{r}
+# Regression coefficients from LU, QR, SVD
+cat("\nRegression coefficients of LU:\n")
+reg_coef_lu
+cat("\nRegression coefficients of QR:\n")
+reg_coef_qr
+cat("\nRegression coefficients of SVD:\n")
+reg_coef_svd
+
+influence_rank<-colnames(X)[order(abs(reg_coef_lu),decreasing=T)[2:8]]
+# 1. Overall quality 2. Full bathrooms above grade
+# 3. Size of garage in car capacity 4. Original construction date
+# 5. Remodel date 6. Above grade (ground) living area square feet
+# 7. First Floor square feet
+cat("\nRanking of variables that influence SalePrice the most:\n")
+influence_rank
+
+```
+
+## Predict house prices:
+```{r}
+start_lu <- Sys.time()
+
+# Using the LU decomposition regression coefficient
+
+X_pred_LU <- subset(test, select = c(OverallQual, GrLivArea, GarageCars, X1stFlrSF, FullBath, YearBuilt, YearRemodAdd))
+
+X_pred_LU <- cbind(1, X_pred_LU) # Add a column of 1's to account for the intercept term.
+
+predicted_prices_LU <- as.matrix(X_pred_LU) %*% reg_coef_lu
+
+print(head(predicted_prices_LU))
+
+end_lu <- Sys.time()
+
+computation_time_lu <- end_lu - start_lu
+```
+
+```{r}
+start_qr <- Sys.time()
+
+# Using the QR decomposition regression coefficient
+
+X_pred_QR <- subset(test, select = c(OverallQual, GrLivArea, GarageCars, X1stFlrSF, FullBath, YearBuilt, YearRemodAdd))
+
+X_pred_QR <- cbind(1, X_pred_QR) # Add a column of 1's to account for the intercept term.
+
+predicted_prices_QR <- as.matrix(X_pred_QR) %*% reg_coef_qr
+ 
+print(head(predicted_prices_QR))
+
+end_qr <- Sys.time()
+
+computation_time_qr <- end_qr - start_qr
+
+```
+```{r}
+start_svd <- Sys.time()
+
+# Using the SVD decomposition regression coefficient
+
+X_pred_SVD <- subset(test, select = c(OverallQual, GrLivArea, GarageCars, X1stFlrSF, FullBath, YearBuilt, YearRemodAdd))
+
+X_pred_SVD <- cbind(1, X_pred_SVD) # Add a column of 1's to account for the intercept term.
+
+predicted_prices_SVD <- as.matrix(X_pred_SVD) %*% reg_coef_svd
+ 
+print(head(predicted_prices_SVD))
+
+end_svd <- Sys.time()
+
+computation_time_svd <- end_svd - start_svd
+```
+Using the LU, QR, SVD decomposition regression coefficients we were able to predict house prices.
+```{r}
+print("These are the computation times for each method:")
+cat("\nComputation time of house prices using LU:\n")
+print(computation_time_lu)
+cat("\nComputation time of house prices using QR:\n")
+print(computation_time_qr)
+cat("\nComputation time of house prices using SVD:\n")
+print(computation_time_svd)
+
+```
+
+
